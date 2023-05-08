@@ -1,6 +1,5 @@
 /*
  *  Copyright (C) 2025 KeePassXC Team <team@keepassxc.org>
- *  Copyright (C) 2017 Sami Vänttinen <sami.vanttinen@protonmail.com>
  *  Copyright (C) 2013 Francois Ferrand
  *
  *  This program is free software: you can redistribute it and/or modify
@@ -79,7 +78,7 @@ public:
     void lockDatabase();
 
     QJsonObject getDatabaseGroups();
-    QJsonArray getDatabaseEntries();
+    QJsonArray getDatabaseEntries(bool* accessDenied, const QSharedPointer<Database>& selectedDb = {});
     QJsonObject createNewGroup(const QString& groupName, bool isPasskeysGroup = false);
     QString getCurrentTotp(const QString& uuid);
     void showPasswordGenerator(const KeyPairMessage& keyPairMessage);
@@ -112,6 +111,12 @@ public:
                            const QString& userHandle,
                            const QString& privateKey);
 #endif
+
+    bool getAlwaysAllowAccess();
+    void setAlwaysAllowAccess(bool enabled);
+    bool getAllowGetDatabaseEntriesRequest();
+    void setAllowGetDatabaseEntriesRequest(bool enabled);
+
     void addEntry(const EntryParameters& entryParameters,
                   const QString& group,
                   const QString& groupUuid,
