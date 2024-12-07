@@ -141,6 +141,9 @@ signals:
     void databaseUnlocked();
     void databaseLockRequested();
     void databaseLocked();
+    // Database locking
+    void lockAndSwitchToFirstUnlockedDatabase();
+    void lockDatabases();
 
     // Emitted in replaceDatabase, may be caused by lock, reload, unlock, load.
     void databaseReplaced(const QSharedPointer<Database>& oldDb, const QSharedPointer<Database>& newDb);

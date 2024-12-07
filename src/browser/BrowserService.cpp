@@ -141,22 +141,26 @@ bool BrowserService::openDatabase(bool triggerUnlock)
     return false;
 }
 
-void BrowserService::lockDatabase()
+void BrowserService::lockDatabase(bool lockSingle)
 {
     if (m_currentDatabaseWidget) {
-        m_currentDatabaseWidget->lock();
+        if (lockSingle) {
+            emit m_currentDatabaseWidget->lockAndSwitchToFirstUnlockedDatabase();
+            return;
+        }
+
+        emit m_currentDatabaseWidget->lockDatabases();
     }
 }
 
-QString BrowserService::getDatabaseHash(bool legacy)
+QString BrowserService::getDatabaseHash()
 {
-    if (legacy) {
-        return QCryptographicHash::hash(
-                   (browserService()->getDatabaseRootUuid() + browserService()->getDatabaseRecycleBinUuid()).toUtf8(),
-                   QCryptographicHash::Sha256)
-            .toHex();
-    }
-    return QCryptographicHash::hash(getDatabaseRootUuid().toUtf8(), QCryptographicHash::Sha256).toHex();
+    return getDatabaseHash(getDatabaseRootUuid());
+}
+
+QString BrowserService::getDatabaseHash(const QString& rootGroupUuid)
+{
+    return QCryptographicHash::hash(rootGroupUuid.toUtf8(), QCryptographicHash::Sha256).toHex();
 }
 
 QString BrowserService::getDatabaseRootUuid()
@@ -172,6 +176,44 @@ QString BrowserService::getDatabaseRootUuid()
     }
 
     return rootGroup->uuidToHex();
+}
+
+// Returns all database hashes, lock/unlock and associated statuses
+QJsonArray BrowserService::getDatabaseStatuses(const StringPairList& keyList)
+{
+    QJsonArray databaseStatuses;
+    const auto openDatabases = getMainWindow()->getOpenDatabases();
+
+    for (const auto& dbWidget : openDatabases) {
+        if (!dbWidget) {
+            continue;
+        }
+
+        QJsonObject databaseObject;
+        const auto db = dbWidget->database();
+
+        if (db && db->rootGroup()) {
+            databaseObject["associated"] = false;
+            databaseObject["hash"] = getDatabaseHash(db->rootGroup()->uuidToHex());
+            databaseObject["locked"] = dbWidget->isLocked();
+
+            if (!dbWidget->isLocked()) {
+                for (const auto& key : db->metadata()->customData()->keys()) {
+                    for (const auto& keyPair : keyList) {
+                        if (key.startsWith(CustomData::BrowserKeyPrefix)
+                            && key == CustomData::BrowserKeyPrefix + keyPair.first
+                            && db->metadata()->customData()->value(key) == keyPair.second) {
+                            databaseObject["associated"] = true;
+                        }
+                    }
+                }
+            }
+
+            databaseStatuses << databaseObject;
+        }
+    }
+
+    return databaseStatuses;
 }
 
 QString BrowserService::getDatabaseRecycleBinUuid()
@@ -287,6 +329,7 @@ QJsonObject BrowserService::createNewGroup(const QString& groupName, bool isPass
     if (group) {
         QJsonObject result;
         result["name"] = group->name();
+        group->setCustomDataTriState(BrowserService::OPTION_HIDE_ENTRY, Group::Disable);
         result["uuid"] = Tools::uuidToHex(group->uuid());
         return result;
     }
@@ -345,29 +388,26 @@ QJsonObject BrowserService::createNewGroup(const QString& groupName, bool isPass
     return result;
 }
 
-QString BrowserService::getCurrentTotp(const QString& uuid)
+QJsonArray BrowserService::getTotp(const StringPairList& keyList, const QStringList& uuids)
 {
-    QList<QSharedPointer<Database>> databases;
-    if (browserSettings()->searchInAllDatabases()) {
-        for (auto dbWidget : getMainWindow()->getOpenDatabases()) {
-            auto db = dbWidget->database();
-            if (db) {
-                databases << db;
+    QJsonArray result;
+
+    const auto databases = getOpenDatabases();
+    for (const auto& db : databases) {
+        if (!isDatabaseConnected(keyList, getDatabaseHash(db->rootGroup()->uuidToHex()))) {
+            continue;
+        }
+
+        for (const auto& u : uuids) {
+            const auto entryUuid = Tools::hexToUuid(u);
+            auto entry = db->rootGroup()->findEntryByUuid(entryUuid, true);
+            if (entry) {
+                result << QJsonObject{{"totp", entry->totp()}, {"uuid", u}};
             }
         }
-    } else {
-        databases << getDatabase();
     }
 
-    auto entryUuid = Tools::hexToUuid(uuid);
-    for (const auto& db : databases) {
-        auto entry = db->rootGroup()->findEntryByUuid(entryUuid, true);
-        if (entry) {
-            return entry->totp();
-        }
-    }
-
-    return {};
+    return result;
 }
 
 QJsonArray
@@ -435,11 +475,6 @@ BrowserService::findEntries(const EntryParameters& entryParameters, const String
         confirmEntries(entriesToConfirm, entryParameters, siteHost, formHost, entryParameters.httpAuth);
     if (!selectedEntriesToConfirm.isEmpty()) {
         allowedEntries.append(selectedEntriesToConfirm);
-    }
-
-    // Ensure that database is not locked when the popup was visible
-    if (!isDatabaseOpened()) {
-        return {};
     }
 
     // Sort results
@@ -550,10 +585,11 @@ void BrowserService::showPasswordGenerator(const KeyPairMessage& keyPairMessage)
                 &PasswordGeneratorWidget::appliedPassword,
                 m_passwordGenerator.data(),
                 [this, keyPairMessage](const QString& password) {
-                    const Parameters params{{"password", password}};
+                    const ResponseParameters params{{"password", password}};
                     m_browserHost->sendClientMessage(keyPairMessage.socket,
                                                      browserMessageBuilder()->buildResponse("generate-password",
                                                                                             keyPairMessage.nonce,
+                                                                                            keyPairMessage.requestId,
                                                                                             params,
                                                                                             keyPairMessage.publicKey,
                                                                                             keyPairMessage.secretKey));
@@ -863,8 +899,7 @@ void BrowserService::addPasskeyToEntry(Entry* entry,
 #endif
 
 void BrowserService::addEntry(const EntryParameters& entryParameters,
-                              const QString& group,
-                              const QString& groupUuid,
+                              const QString& groupPath,
                               const bool downloadFavicon,
                               const QSharedPointer<Database>& selectedDb)
 {
@@ -874,6 +909,10 @@ void BrowserService::addEntry(const EntryParameters& entryParameters,
         return;
     }
 
+    // Handle new/existing group
+    const auto createResponse = createNewGroup(groupPath.isEmpty() ? KEEPASSXCBROWSER_GROUP_NAME : groupPath, true);
+    const auto group = db->rootGroup()->findGroupByUuid(Tools::hexToUuid(createResponse["uuid"].toString()));
+
     auto* entry = new Entry();
     entry->setUuid(QUuid::createUuid());
     entry->setTitle(entryParameters.title.isEmpty() ? QUrl(entryParameters.siteUrl).host() : entryParameters.title);
@@ -881,20 +920,7 @@ void BrowserService::addEntry(const EntryParameters& entryParameters,
     entry->setIcon(KEEPASSXCBROWSER_DEFAULT_ICON);
     entry->setUsername(entryParameters.login);
     entry->setPassword(entryParameters.password);
-
-    // Select a group for the entry
-    if (!group.isEmpty()) {
-        if (db->rootGroup()) {
-            auto selectedGroup = db->rootGroup()->findGroupByUuid(Tools::hexToUuid(groupUuid));
-            if (selectedGroup) {
-                entry->setGroup(selectedGroup);
-            } else {
-                entry->setGroup(getDefaultEntryGroup(db));
-            }
-        }
-    } else {
-        entry->setGroup(getDefaultEntryGroup(db));
-    }
+    entry->setGroup(group);
 
     const QString host = QUrl(entryParameters.siteUrl).host();
     const QString submitHost = QUrl(entryParameters.formUrl).host();
@@ -925,7 +951,7 @@ bool BrowserService::updateEntry(const EntryParameters& entryParameters, const Q
     auto entry = db->rootGroup()->findEntryByUuid(Tools::hexToUuid(uuid));
     if (!entry) {
         // If entry is not found for update, add a new one to the selected database
-        addEntry(entryParameters, "", "", false, db);
+        addEntry(entryParameters, "", false, db);
         return true;
     }
 
@@ -1070,6 +1096,7 @@ QList<Entry*> BrowserService::searchEntries(const QString& siteUrl,
                                             const StringPairList& keyList,
                                             bool passkey)
 {
+    /*
     // Check if database is connected with KeePassXC-Browser. If so, return browser key (otherwise empty)
     auto databaseConnected = [&](const QSharedPointer<Database>& db) {
         for (const StringPair& keyPair : keyList) {
@@ -1086,29 +1113,31 @@ QList<Entry*> BrowserService::searchEntries(const QString& siteUrl,
     QList<QSharedPointer<Database>> databases;
     QStringList keys;
     if (browserSettings()->searchInAllDatabases()) {
-        for (auto dbWidget : getMainWindow()->getOpenDatabases()) {
-            auto db = dbWidget->database();
-            auto key = databaseConnected(dbWidget->database());
-            if (db && !key.isEmpty()) {
-                databases << db;
-                keys << key;
-            }
-        }
+       for (auto dbWidget : getMainWindow()->getOpenDatabases()) {
+           auto db = dbWidget->database();
+           auto key = databaseConnected(dbWidget->database());
+           if (db && !key.isEmpty()) {
+               databases << db;
+               keys << key;
+           }
+       }
     } else {
-        const auto& db = getDatabase();
-        auto key = databaseConnected(db);
-        if (!key.isEmpty()) {
-            databases << db;
-            keys << key;
-        }
+       const auto& db = getDatabase();
+       auto key = databaseConnected(db);
+       if (!key.isEmpty()) {
+           databases << db;
+           keys << key;
+       }
     }
+    */
+    const auto connectedDatabases = getConnectedDatabases(keyList);
 
     // Search entries matching the hostname
     QString hostname = QUrl(siteUrl).host();
     QList<Entry*> entries;
     do {
-        for (const auto& db : databases) {
-            entries << searchEntries(db, siteUrl, formUrl, keys, passkey);
+        for (const auto& db : connectedDatabases) {
+            entries << searchEntries(db, siteUrl, formUrl, {}, passkey); // TODO: Add keys stringlist
         }
     } while (entries.isEmpty() && removeFirstDomain(hostname));
 
@@ -1197,7 +1226,7 @@ QJsonObject BrowserService::prepareEntry(const Entry* entry)
     }
 
     if (entry->isExpired()) {
-        res["expired"] = TRUE_STR;
+        res["expired"] = true;
     }
 
     auto skipAutoSubmitGroup = entry->group()->resolveCustomDataTriState(BrowserService::OPTION_SKIP_AUTO_SUBMIT);
@@ -1206,11 +1235,11 @@ QJsonObject BrowserService::prepareEntry(const Entry* entry)
             res["skipAutoSubmit"] = entry->customData()->value(BrowserService::OPTION_SKIP_AUTO_SUBMIT);
         }
     } else {
-        res["skipAutoSubmit"] = skipAutoSubmitGroup == Group::Enable ? TRUE_STR : FALSE_STR;
+        res["skipAutoSubmit"] = skipAutoSubmitGroup == Group::Enable;
     }
 
     if (browserSettings()->supportKphFields()) {
-        const EntryAttributes* attr = entry->attributes();
+        const auto* attr = entry->attributes();
         QJsonArray stringFields;
         for (const auto& key : attr->keys()) {
             if (key.startsWith("KPH: ")) {
@@ -1616,17 +1645,6 @@ QSharedPointer<Database> BrowserService::getDatabase(const QUuid& rootGroupUuid)
     return {};
 }
 
-QList<QSharedPointer<Database>> BrowserService::getOpenDatabases()
-{
-    QList<QSharedPointer<Database>> databaseList;
-    for (auto dbWidget : getMainWindow()->getOpenDatabases()) {
-        if (!dbWidget->isLocked()) {
-            databaseList << dbWidget->database();
-        }
-    }
-    return databaseList;
-}
-
 QSharedPointer<Database> BrowserService::selectedDatabase()
 {
     QList<DatabaseWidget*> databaseWidgets;
@@ -1654,6 +1672,50 @@ QSharedPointer<Database> BrowserService::selectedDatabase()
 
     // Return current database
     return getDatabase();
+}
+
+QList<QSharedPointer<Database>> BrowserService::getOpenDatabases()
+{
+    QList<QSharedPointer<Database>> databases;
+    for (const auto& dbWidget : getMainWindow()->getOpenDatabases()) {
+        if (dbWidget && !dbWidget->isLocked()) {
+            const auto db = dbWidget->database();
+            if (db && db->rootGroup()) {
+                databases << db;
+            }
+        }
+    }
+
+    return databases;
+}
+
+QList<QSharedPointer<Database>> BrowserService::getConnectedDatabases(const StringPairList& keyList)
+{
+    const auto databaseStatuses = getDatabaseStatuses(keyList);
+    const auto openDatabases = getOpenDatabases();
+    QList<QSharedPointer<Database>> connectedDatabases;
+
+    for (const auto& db : openDatabases) {
+        const auto hash = getDatabaseHash(db->rootGroup()->uuidToHex());
+        for (const auto& dbStatus : databaseStatuses) {
+            if (dbStatus["hash"].toString() == hash && dbStatus["associated"] == true) {
+                connectedDatabases << db;
+            }
+        }
+    }
+
+    return connectedDatabases;
+}
+
+// Check if selected database is connected to KeePassXC. If no hash is provided, active database's hash is used.
+bool BrowserService::isDatabaseConnected(const StringPairList& keyList, const QString& databaseHash)
+{
+    const auto databaseStatuses = getDatabaseStatuses(keyList);
+    const auto hash = databaseHash.isEmpty() ? getDatabaseHash() : databaseHash;
+
+    return std::any_of(databaseStatuses.begin(), databaseStatuses.end(), [&hash](const auto& status) {
+        return status["hash"].toString() == hash && status["associated"] == true;
+    });
 }
 
 void BrowserService::hideWindow() const
@@ -1764,7 +1826,7 @@ void BrowserService::handleDatabaseUnlockDialogFinished(bool accepted, DatabaseW
     }
 }
 
-void BrowserService::processClientMessage(QLocalSocket* socket, const QJsonObject& message)
+void BrowserService::processClientMessage(const QJsonObject& message, QLocalSocket* socket)
 {
     auto clientID = message["clientID"].toString();
     if (clientID.isEmpty()) {
@@ -1777,6 +1839,6 @@ void BrowserService::processClientMessage(QLocalSocket* socket, const QJsonObjec
     }
 
     auto& action = m_browserClients.value(clientID);
-    auto response = action->processClientMessage(socket, message);
+    auto response = action->processClientMessage(message, socket);
     m_browserHost->sendClientMessage(socket, response);
 }
