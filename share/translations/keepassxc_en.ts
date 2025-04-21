@@ -1274,6 +1274,10 @@ Do you want to overwrite the passkey in %1 - %2?</source>
         <source>Browsers installed using Snap or Flatpak are not supported with exception to Firefox installed using Snap.</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>&lt;b&gt;Error:&lt;/b&gt; The installed proxy executable is missing from the expected location: %1&lt;br/&gt;Please set a custom proxy location in the advanced settings or reinstall the application.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>CloneDialog</name>
