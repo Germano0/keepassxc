@@ -46,7 +46,7 @@ static const QString BROWSER_REQUEST_REQUEST_AUTOTYPE = QStringLiteral("request-
 static const QString BROWSER_REQUEST_SET_LOGIN = QStringLiteral("set-login");
 static const QString BROWSER_REQUEST_TEST_ASSOCIATE = QStringLiteral("test-associate");
 
-QJsonObject BrowserAction::processClientMessage(QLocalSocket* socket, const QJsonObject& json)
+template <typename T> QJsonObject BrowserAction::processClientMessage(T* socket, const QJsonObject& json)
 {
     if (json.isEmpty()) {
         return getErrorReply("", ERROR_KEEPASS_EMPTY_MESSAGE_RECEIVED);
@@ -75,10 +75,14 @@ QJsonObject BrowserAction::processClientMessage(QLocalSocket* socket, const QJso
     return handleAction(socket, json);
 }
 
+// Explicit template instantiation
+template QJsonObject BrowserAction::processClientMessage<QLocalSocket>(QLocalSocket*, const QJsonObject&);
+template QJsonObject BrowserAction::processClientMessage<QWebSocket>(QWebSocket*, const QJsonObject&);
+
 // Private functions
 ///////////////////////
 
-QJsonObject BrowserAction::handleAction(QLocalSocket* socket, const QJsonObject& json)
+template <typename T> QJsonObject BrowserAction::handleAction(T* socket, const QJsonObject& json)
 {
     QString action = json.value("action").toString();
 
@@ -262,7 +266,8 @@ QJsonObject BrowserAction::handleGetLogins(const QJsonObject& json, const QStrin
     return buildResponse(action, browserRequest.incrementedNonce, params);
 }
 
-QJsonObject BrowserAction::handleGeneratePassword(QLocalSocket* socket, const QJsonObject& json, const QString& action)
+template <typename T>
+QJsonObject BrowserAction::handleGeneratePassword(T* socket, const QJsonObject& json, const QString& action)
 {
     const auto browserRequest = decodeRequest(json);
     if (browserRequest.isEmpty()) {
@@ -281,11 +286,12 @@ QJsonObject BrowserAction::handleGeneratePassword(QLocalSocket* socket, const QJ
         }
 
         // Show the existing password generator
-        browserService()->showPasswordGenerator({});
+        // browserService()->showPasswordGenerator({});
+        browserService()->showPasswordGenerator(KeyPairMessage<T>{});
         return errorReply;
     }
 
-    KeyPairMessage keyPairMessage{socket, browserRequest.incrementedNonce, m_clientPublicKey, m_secretKey};
+    KeyPairMessage<T> keyPairMessage{socket, browserRequest.incrementedNonce, m_clientPublicKey, m_secretKey};
 
     browserService()->showPasswordGenerator(keyPairMessage);
     return {};

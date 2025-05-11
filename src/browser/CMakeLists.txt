@@ -1,4 +1,4 @@
-#  Copyright (C) 2024 KeePassXC Team <team@keepassxc.org>
+#  Copyright (C) 2025 KeePassXC Team <team@keepassxc.org>
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -28,6 +28,7 @@ if(WITH_XC_BROWSER)
             BrowserService.cpp
             BrowserSettings.cpp
             BrowserShared.cpp
+            BrowserWebSocketHost.cpp
             CustomTableWidget.cpp
             NativeMessageInstaller.cpp)
 
@@ -41,5 +42,5 @@ if(WITH_XC_BROWSER)
     endif()
 
     add_library(browser STATIC ${browser_SOURCES})
-    target_link_libraries(browser Qt5::Core Qt5::Concurrent Qt5::Widgets Qt5::Network ${BOTAN_LIBRARIES})
+    target_link_libraries(browser Qt5::Core Qt5::Concurrent Qt5::Widgets Qt5::Network Qt5::WebSockets ${BOTAN_LIBRARIES})
 endif()

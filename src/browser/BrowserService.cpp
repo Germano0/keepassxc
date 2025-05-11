@@ -24,6 +24,7 @@
 #include "BrowserHost.h"
 #include "BrowserMessageBuilder.h"
 #include "BrowserSettings.h"
+#include "BrowserWebSocketHost.h"
 #include "core/EntryAttributes.h"
 #include "core/Tools.h"
 #include "gui/MainWindow.h"
@@ -53,6 +54,7 @@
 #include <QProgressDialog>
 #include <QStringView>
 #include <QUrl>
+#include <QtWebSockets/qwebsocket.h>
 
 const QString BrowserService::KEEPASSXCBROWSER_NAME = QStringLiteral("KeePassXC-Browser Settings");
 const QString BrowserService::KEEPASSXCBROWSER_OLD_NAME = QStringLiteral("keepassxc-browser Settings");
@@ -78,12 +80,17 @@ Q_GLOBAL_STATIC(BrowserService, s_browserService);
 BrowserService::BrowserService()
     : QObject()
     , m_browserHost(new BrowserHost)
+    , m_browserWebSocketHost(new BrowserWebSocketHost)
     , m_dialogActive(false)
     , m_bringToFrontRequested(false)
     , m_prevWindowState(WindowState::Normal)
     , m_keepassBrowserUUID(Tools::hexToUuid("de887cc3036343b8974b5911b8816224"))
 {
-    connect(m_browserHost, &BrowserHost::clientMessageReceived, this, &BrowserService::processClientMessage);
+    connect(m_browserHost, &BrowserHost::clientMessageReceived, this, &BrowserService::processLocalSocketClientMessage);
+    connect(m_browserWebSocketHost,
+            &BrowserWebSocketHost::clientMessageReceived,
+            this,
+            &BrowserService::processWebSocketClientMessage);
     connect(getMainWindow(), &MainWindow::databaseUnlocked, this, &BrowserService::databaseUnlocked);
     connect(getMainWindow(), &MainWindow::databaseLocked, this, &BrowserService::databaseLocked);
     connect(getMainWindow(), &MainWindow::activeDatabaseChanged, this, &BrowserService::activeDatabaseChanged);
@@ -109,8 +116,12 @@ void BrowserService::setEnabled(bool enabled)
         }
 
         m_browserHost->start();
+        if (browserSettings()->webSocketSupport()) {
+            m_browserWebSocketHost->start();
+        }
     } else {
         m_browserHost->stop();
+        m_browserWebSocketHost->stop();
     }
 }
 
@@ -527,7 +538,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
     return allowedEntries;
 }
 
-void BrowserService::showPasswordGenerator(const KeyPairMessage& keyPairMessage)
+template <typename T> void BrowserService::showPasswordGenerator(const KeyPairMessage<T>& keyPairMessage)
 {
     if (!m_passwordGenerator) {
         m_passwordGenerator = PasswordGeneratorWidget::popupGenerator();
@@ -539,7 +550,11 @@ void BrowserService::showPasswordGenerator(const KeyPairMessage& keyPairMessage)
                     if (!m_passwordGenerator->isPasswordGenerated()) {
                         auto errorMessage = browserMessageBuilder()->getErrorReply(
                             "generate-password", ERROR_KEEPASS_ACTION_CANCELLED_OR_DENIED);
-                        m_browserHost->sendClientMessage(keyPairMessage.socket, errorMessage);
+                        if constexpr (std::is_same<T, QWebSocket>::value) {
+                            m_browserWebSocketHost->sendClientMessage(keyPairMessage.socket, errorMessage);
+                        } else {
+                            m_browserHost->sendClientMessage(keyPairMessage.socket, errorMessage);
+                        }
                     }
 
                     QTimer::singleShot(50, this, [&] { hideWindow(); });
@@ -550,12 +565,24 @@ void BrowserService::showPasswordGenerator(const KeyPairMessage& keyPairMessage)
                 m_passwordGenerator.data(),
                 [this, keyPairMessage](const QString& password) {
                     const Parameters params{{"password", password}};
-                    m_browserHost->sendClientMessage(keyPairMessage.socket,
-                                                     browserMessageBuilder()->buildResponse("generate-password",
-                                                                                            keyPairMessage.nonce,
-                                                                                            params,
-                                                                                            keyPairMessage.publicKey,
-                                                                                            keyPairMessage.secretKey));
+                    if constexpr (std::is_same<T, QWebSocket>::value) {
+                        m_browserWebSocketHost->sendClientMessage(
+                            keyPairMessage.socket,
+                            browserMessageBuilder()->buildResponse("generate-password",
+                                                                   keyPairMessage.nonce,
+                                                                   params,
+                                                                   keyPairMessage.publicKey,
+                                                                   keyPairMessage.secretKey));
+
+                    } else {
+                        m_browserHost->sendClientMessage(
+                            keyPairMessage.socket,
+                            browserMessageBuilder()->buildResponse("generate-password",
+                                                                   keyPairMessage.nonce,
+                                                                   params,
+                                                                   keyPairMessage.publicKey,
+                                                                   keyPairMessage.secretKey));
+                    }
                 });
     }
 
@@ -564,6 +591,9 @@ void BrowserService::showPasswordGenerator(const KeyPairMessage& keyPairMessage)
     m_passwordGenerator->raise();
     m_passwordGenerator->activateWindow();
 }
+
+template void BrowserService::showPasswordGenerator<QLocalSocket>(const KeyPairMessage<QLocalSocket>&);
+template void BrowserService::showPasswordGenerator<QWebSocket>(const KeyPairMessage<QWebSocket>&);
 
 bool BrowserService::isPasswordGeneratorRequested() const
 {
@@ -1763,11 +1793,23 @@ void BrowserService::handleDatabaseUnlockDialogFinished(bool accepted, DatabaseW
     }
 }
 
-void BrowserService::processClientMessage(QLocalSocket* socket, const QJsonObject& message)
+void BrowserService::processLocalSocketClientMessage(QLocalSocket* socket, const QJsonObject& message)
+{
+    auto response = processClientMessage<QLocalSocket>(socket, message);
+    m_browserHost->sendClientMessage(socket, response);
+}
+
+void BrowserService::processWebSocketClientMessage(QWebSocket* socket, const QJsonObject& message)
+{
+    auto response = processClientMessage<QWebSocket>(socket, message);
+    m_browserWebSocketHost->sendClientMessage(socket, response);
+}
+
+template <typename T> QJsonObject BrowserService::processClientMessage(T* socket, const QJsonObject& message)
 {
     auto clientID = message["clientID"].toString();
     if (clientID.isEmpty()) {
-        return;
+        return {};
     }
 
     // Create a new client action if we haven't seen this id yet
@@ -1776,6 +1818,7 @@ void BrowserService::processClientMessage(QLocalSocket* socket, const QJsonObjec
     }
 
     auto& action = m_browserClients.value(clientID);
-    auto response = action->processClientMessage(socket, message);
-    m_browserHost->sendClientMessage(socket, response);
+    return action->processClientMessage<T>(socket, message);
+    // auto response = action->processClientMessage(socket, message);
+    // m_browserHost->sendClientMessage(socket, response);
 }
