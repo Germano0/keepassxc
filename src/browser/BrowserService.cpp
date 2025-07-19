@@ -24,6 +24,7 @@
 #include "BrowserHost.h"
 #include "BrowserMessageBuilder.h"
 #include "BrowserSettings.h"
+#include "CredentialDialog.h"
 #include "core/EntryAttributes.h"
 #include "core/Tools.h"
 #include "gui/MainWindow.h"
@@ -448,7 +449,7 @@ BrowserService::findEntries(const EntryParameters& entryParameters, const String
             continue;
         }
 
-        switch (checkAccess(entry, siteHost, formHost, entryParameters.realm)) {
+        switch (checkAccess(entry, siteHost, formHost)) {
         case Denied:
             continue;
 
@@ -511,7 +512,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
 
     connect(&accessControlDialog, &BrowserAccessControlDialog::disableAccess, [&](QTableWidgetItem* item) {
         auto entry = entriesToConfirm[item->row()];
-        denyEntry(entry, siteHost, formUrl, entryParameters.realm);
+        denyEntry(entry, siteHost, formUrl);
     });
 
     accessControlDialog.setEntries(entriesToConfirm, entryParameters.siteUrl, httpAuth);
@@ -523,7 +524,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
     // All are denied
     if (ret == QDialog::Rejected && remember) {
         for (auto& entry : entriesToConfirm) {
-            denyEntry(entry, siteHost, formUrl, entryParameters.realm);
+            denyEntry(entry, siteHost, formUrl);
         }
     }
 
@@ -535,7 +536,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
             allowedEntries.append(entry);
 
             if (remember) {
-                allowEntry(entry, siteHost, formUrl, entryParameters.realm);
+                allowEntry(entry, siteHost, formUrl);
             }
         }
 
@@ -544,7 +545,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
             auto nonSelectedEntries = accessControlDialog.getEntries(SelectionType::NonSelected);
             for (auto& item : nonSelectedEntries) {
                 auto entry = entriesToConfirm[item->row()];
-                denyEntry(entry, siteHost, formUrl, entryParameters.realm);
+                denyEntry(entry, siteHost, formUrl);
             }
         }
     }
@@ -553,7 +554,7 @@ QList<Entry*> BrowserService::confirmEntries(QList<Entry*>& entriesToConfirm,
     auto disabledEntries = accessControlDialog.getEntries(SelectionType::Disabled);
     for (auto& item : disabledEntries) {
         auto entry = entriesToConfirm[item->row()];
-        denyEntry(entry, siteHost, formUrl, entryParameters.realm);
+        denyEntry(entry, siteHost, formUrl);
     }
 
     // Re-hide the application if it wasn't visible before
@@ -898,20 +899,79 @@ void BrowserService::addPasskeyToEntry(Entry* entry,
 }
 #endif
 
+bool BrowserService::createEntry(const EntryParameters& entryParameters, const bool downloadFavicon)
+{
+    auto db = getDatabase();
+    if (!db) {
+        return false;
+    }
+
+    CredentialDialog credentialDialog(m_currentDatabaseWidget);
+    credentialDialog.setInfo(entryParameters.siteUrl, entryParameters.login, db, false);
+
+    auto ret = credentialDialog.exec();
+    if (ret != QDialog::Accepted) {
+        return false;
+    }
+
+    auto selectedDb = credentialDialog.getSelectedDatabase();
+
+    // Update password to selected entry
+    if (!credentialDialog.createNewEntry()) {
+        auto groupUuid = credentialDialog.getSelectedGroupUuid();
+        auto group = db->rootGroup()->findGroupByUuid(groupUuid);
+
+        if (group) {
+            auto selectedEntry = group->findEntryByUuid(credentialDialog.getSelectedEntryUuid());
+            if (selectedEntry) {
+                updateEntry(entryParameters, selectedEntry, selectedDb);
+            }
+        }
+
+        return true;
+    }
+
+    // Group settings. Use default group if user did not select a specific one.
+    Group* group = nullptr;
+
+    // Attempt to use the selected group
+    if (!credentialDialog.useDefaultGroup()) {
+        auto groupUuid = credentialDialog.getSelectedGroupUuid();
+        group = selectedDb->rootGroup()->findGroupByUuid(groupUuid);
+    }
+
+    // Use default group if requested or if the selected group does not exist
+    if (!group) {
+        group = getDefaultGroup(selectedDb);
+    }
+
+    addEntry(entryParameters, group, downloadFavicon, selectedDb);
+    return true;
+}
+
+Group* BrowserService::getDefaultGroup(QSharedPointer<Database>& database) const
+{
+    auto defaultGroup = database->rootGroup()->findGroupByPath(KEEPASSXCBROWSER_GROUP_NAME);
+
+    // Create the default group if it does not exist
+    if (!defaultGroup) {
+        defaultGroup = new Group();
+        defaultGroup->setName(KEEPASSXCBROWSER_GROUP_NAME);
+        defaultGroup->setUuid(QUuid::createUuid());
+        defaultGroup->setParent(database->rootGroup());
+    }
+
+    return defaultGroup;
+}
+
 void BrowserService::addEntry(const EntryParameters& entryParameters,
-                              const QString& groupPath,
+                              Group* group,
                               const bool downloadFavicon,
                               const QSharedPointer<Database>& selectedDb)
 {
-    // TODO: select database based on this key id
-    auto db = selectedDb ? selectedDb : selectedDatabase();
-    if (!db) {
+    if (!selectedDb) {
         return;
     }
-
-    // Handle new/existing group
-    const auto createResponse = createNewGroup(groupPath.isEmpty() ? KEEPASSXCBROWSER_GROUP_NAME : groupPath, true);
-    const auto group = db->rootGroup()->findGroupByUuid(Tools::hexToUuid(createResponse["uuid"].toString()));
 
     auto* entry = new Entry();
     entry->setUuid(QUuid::createUuid());
@@ -920,7 +980,13 @@ void BrowserService::addEntry(const EntryParameters& entryParameters,
     entry->setIcon(KEEPASSXCBROWSER_DEFAULT_ICON);
     entry->setUsername(entryParameters.login);
     entry->setPassword(entryParameters.password);
-    entry->setGroup(group);
+
+    // Select a group for the entry
+    if (group) {
+        entry->setGroup(group);
+    } else {
+        entry->setGroup(getDefaultEntryGroup(selectedDb));
+    }
 
     const QString host = QUrl(entryParameters.siteUrl).host();
     const QString submitHost = QUrl(entryParameters.formUrl).host();
@@ -930,9 +996,6 @@ void BrowserService::addEntry(const EntryParameters& entryParameters,
     if (!submitHost.isEmpty()) {
         config.allow(submitHost);
     }
-    if (!entryParameters.realm.isEmpty()) {
-        config.setRealm(entryParameters.realm);
-    }
     config.save(entry);
 
     if (downloadFavicon && m_currentDatabaseWidget) {
@@ -940,26 +1003,19 @@ void BrowserService::addEntry(const EntryParameters& entryParameters,
     }
 }
 
-bool BrowserService::updateEntry(const EntryParameters& entryParameters, const QString& uuid)
+bool BrowserService::updateEntry(const EntryParameters& entryParameters,
+                                 Entry* entry,
+                                 const QSharedPointer<Database>& selectedDb)
 {
-    // TODO: select database based on this key id
-    auto db = selectedDatabase();
-    if (!db) {
+    if (!selectedDb || !entry) {
         return false;
-    }
-
-    auto entry = db->rootGroup()->findEntryByUuid(Tools::hexToUuid(uuid));
-    if (!entry) {
-        // If entry is not found for update, add a new one to the selected database
-        addEntry(entryParameters, "", false, db);
-        return true;
     }
 
     // Check if the entry password is a reference. If so, update the original entry instead
     while (entry->attributes()->isReference(EntryAttributes::PasswordKey)) {
         const QUuid referenceUuid = entry->attributes()->referenceUuid(EntryAttributes::PasswordKey);
         if (!referenceUuid.isNull()) {
-            entry = db->rootGroup()->findEntryByUuid(referenceUuid);
+            entry = selectedDb->rootGroup()->findEntryByUuid(referenceUuid);
             if (!entry) {
                 return false;
             }
@@ -1178,7 +1234,7 @@ QList<Entry*> BrowserService::sortEntries(QList<Entry*>& entries, const QString&
     return results;
 }
 
-void BrowserService::allowEntry(Entry* entry, const QString& siteHost, const QString& formUrl, const QString& realm)
+void BrowserService::allowEntry(Entry* entry, const QString& siteHost, const QString& formUrl)
 {
     BrowserEntryConfig config;
     config.load(entry);
@@ -1188,14 +1244,10 @@ void BrowserService::allowEntry(Entry* entry, const QString& siteHost, const QSt
         config.allow(formUrl);
     }
 
-    if (!realm.isEmpty()) {
-        config.setRealm(realm);
-    }
-
     config.save(entry);
 }
 
-void BrowserService::denyEntry(Entry* entry, const QString& siteHost, const QString& formUrl, const QString& realm)
+void BrowserService::denyEntry(Entry* entry, const QString& siteHost, const QString& formUrl)
 {
     BrowserEntryConfig config;
     config.load(entry);
@@ -1203,10 +1255,6 @@ void BrowserService::denyEntry(Entry* entry, const QString& siteHost, const QStr
 
     if (!formUrl.isEmpty() && siteHost != formUrl) {
         config.deny(formUrl);
-    }
-
-    if (!realm.isEmpty()) {
-        config.setRealm(realm);
     }
 
     config.save(entry);
@@ -1253,8 +1301,7 @@ QJsonObject BrowserService::prepareEntry(const Entry* entry)
     return res;
 }
 
-BrowserService::Access
-BrowserService::checkAccess(const Entry* entry, const QString& siteHost, const QString& formHost, const QString& realm)
+BrowserService::Access BrowserService::checkAccess(const Entry* entry, const QString& siteHost, const QString& formHost)
 {
     if (entry->isExpired() && !browserSettings()->allowExpiredCredentials()) {
         return Denied;
@@ -1268,9 +1315,6 @@ BrowserService::checkAccess(const Entry* entry, const QString& siteHost, const Q
         return Allowed;
     }
     if ((config.isDenied(siteHost)) || (!formHost.isEmpty() && config.isDenied(formHost))) {
-        return Denied;
-    }
-    if (!realm.isEmpty() && config.realm() != realm) {
         return Denied;
     }
     return Unknown;

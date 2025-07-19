@@ -303,8 +303,7 @@ if(WITH_XC_BROWSER_PASSKEYS)
             gui/reports/ReportsPagePasskeys.cpp
             gui/passkeys/PasskeyExporter.cpp
             gui/passkeys/PasskeyExportDialog.cpp
-            gui/passkeys/PasskeyImporter.cpp
-            gui/passkeys/PasskeyImportDialog.cpp)
+            gui/passkeys/PasskeyImporter.cpp)
 endif()
 
 add_subdirectory(autotype)
